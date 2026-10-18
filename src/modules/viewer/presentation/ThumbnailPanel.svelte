@@ -40,8 +40,12 @@
   });
 </script>
 
-<div class={`absolute inset-y-0 left-0 z-20 flex transition-transform duration-200 ${visible ? "translate-x-0" : "-translate-x-full"}`}>
-  <aside class="viewer-scrollbar flex w-[78px] flex-col gap-2 overflow-y-auto border-r border-white/10 bg-[#0b0f17]/96 p-2 shadow-2xl backdrop-blur-xl">
+<div
+  class={`absolute inset-y-0 left-0 z-20 flex transition-transform duration-200 ${visible ? "translate-x-0" : "-translate-x-full"}`}
+>
+  <aside
+    class="viewer-scrollbar flex w-[78px] flex-col gap-2 overflow-y-auto border-r border-white/10 bg-[#0b0f17]/96 p-2 shadow-2xl backdrop-blur-xl"
+  >
     {#each Array(pageCount) as _, index}
       {@const page = index + 1}
 
@@ -52,7 +56,11 @@
         onclick={() => onSelect(page)}
       >
         {#if thumbs[page]}
-          <img src={thumbs[page]} alt={`Halaman ${page}`} class="w-full rounded-sm" />
+          <img
+            src={thumbs[page]}
+            alt={`Halaman ${page}`}
+            class="w-full rounded-sm"
+          />
         {:else}
           <div class="aspect-[3/4] animate-pulse rounded bg-white/5"></div>
         {/if}

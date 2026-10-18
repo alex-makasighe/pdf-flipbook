@@ -4,6 +4,14 @@
   import ViewerToolbar from "./ViewerToolbar.svelte";
   import type { PdfService } from "../services/PdfService";
 
+  //   import type { Component } from "svelte";
+  //   const checkComponent: Component<{
+  //   pageCount: number;
+  //   currentPage: number;
+  //   pdfService: PdfService | null;
+  //   onSelect: (page: number) => void;
+  // }> = ThumbnailPanel;
+
   type Props = {
     pdfUrl: string;
     title: string;

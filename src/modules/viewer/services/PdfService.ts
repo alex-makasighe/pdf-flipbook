@@ -19,7 +19,7 @@ export class PdfService {
 
     pdfjs.GlobalWorkerOptions.workerSrc = new URL(
       "pdfjs-dist/build/pdf.worker.min.mjs",
-      import.meta.url
+      import.meta.url,
     ).toString();
 
     this.pdfjs = pdfjs;
@@ -64,7 +64,7 @@ export class PdfService {
     pageNumber: number,
     canvas: HTMLCanvasElement,
     scale: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
   ): Promise<{ width: number; height: number }> {
     const page = await this.getPage(pageNumber);
 
