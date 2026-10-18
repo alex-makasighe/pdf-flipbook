@@ -63,8 +63,17 @@
     mobile = window.matchMedia("(max-width: 767px)").matches;
   }
 
+  function isOddFinalSpread(current: number): boolean {
+    return (
+      !mobile &&
+      pdfService.numPages > 1 &&
+      pdfService.numPages % 2 === 1 &&
+      current === pdfService.numPages - 1
+    );
+  }
+
   function spreadStart(current: number): number {
-    if (mobile || isCoverPage(current)) {
+    if (mobile || isCoverPage(current) || isOddFinalSpread(current)) {
       return current;
     }
 
@@ -76,7 +85,45 @@
       return current;
     }
 
+    // Untuk PDF ganjil, halaman sebelum sampul belakang tetap menjadi
+    // spread dua halaman: halaman terakhir di kiri dan sisi kanan kosong.
+    if (isOddFinalSpread(current)) {
+      return pdfService.numPages + 1;
+    }
+
     return current % 2 === 1 ? current : current + 1;
+  }
+
+  function nextPage(current: number): number {
+    if (mobile) {
+      return flipService.next(current, pdfService.numPages, true);
+    }
+
+    // Sisipkan spread terakhir (halaman N-1 + sisi kanan kosong) sebelum
+    // sampul belakang pada PDF dengan jumlah halaman ganjil.
+    if (pdfService.numPages % 2 === 1 && current === pdfService.numPages - 2) {
+      return pdfService.numPages - 1;
+    }
+    if (isOddFinalSpread(current)) {
+      return pdfService.numPages;
+    }
+
+    return flipService.next(current, pdfService.numPages, false);
+  }
+
+  function previousPage(current: number): number {
+    if (mobile) {
+      return flipService.previous(current, pdfService.numPages, true);
+    }
+
+    if (pdfService.numPages % 2 === 1 && current === pdfService.numPages) {
+      return pdfService.numPages - 1;
+    }
+    if (isOddFinalSpread(current)) {
+      return pdfService.numPages - 2;
+    }
+
+    return flipService.previous(current, pdfService.numPages, false);
   }
 
   // Sampul depan dan belakang tampil sebagai satu halaman di tengah.
@@ -154,7 +201,11 @@
         const right = spreadEnd(page);
 
         await renderPage(left, leftCanvas, scale);
-        await renderPage(right, rightCanvas, scale);
+        if (right > pdfService.numPages) {
+          clearCanvas(rightCanvas);
+        } else {
+          await renderPage(right, rightCanvas, scale);
+        }
       }
 
       loading = false;
@@ -218,10 +269,7 @@
       return;
     }
 
-    const target =
-      direction === "next"
-        ? flipService.next(page, pdfService.numPages, mobile)
-        : flipService.previous(page, pdfService.numPages, mobile);
+    const target = direction === "next" ? nextPage(page) : previousPage(page);
 
     if (target === page) {
       return;
@@ -322,10 +370,7 @@
   async function commitFlip(direction: FlipDirection): Promise<void> {
     if (flipping || !pdfService.isLoaded) return;
 
-    const target =
-      direction === "next"
-        ? flipService.next(page, pdfService.numPages, mobile)
-        : flipService.previous(page, pdfService.numPages, mobile);
+    const target = direction === "next" ? nextPage(page) : previousPage(page);
 
     if (target === page) {
       resetFlip();
@@ -357,7 +402,11 @@
         const targetLeft = spreadStart(target);
         const targetRight = spreadEnd(target);
         await renderPage(targetLeft, leftCanvas, scale);
-        await renderPage(targetRight, rightCanvas, scale);
+        if (targetRight > pdfService.numPages) {
+          clearCanvas(rightCanvas);
+        } else {
+          await renderPage(targetRight, rightCanvas, scale);
+        }
       }
 
       // Baru tampilkan layer flip setelah canvas depan/belakang dan spread
@@ -377,7 +426,11 @@
         const targetLeft = spreadStart(target);
         const targetRight = spreadEnd(target);
         await renderPage(targetLeft, leftCanvas, scale);
-        await renderPage(targetRight, rightCanvas, scale);
+        if (targetRight > pdfService.numPages) {
+          clearCanvas(rightCanvas);
+        } else {
+          await renderPage(targetRight, rightCanvas, scale);
+        }
       }
 
       skipNextPageRender = true;
