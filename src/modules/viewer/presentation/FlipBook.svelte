@@ -68,21 +68,34 @@
     mobile = window.matchMedia("(max-width: 767px)").matches;
   }
 
+  // function isOddFinalSpread(current: number): boolean {
+  //   return (
+  //     !mobile &&
+  //     pdfService.numPages > 1 &&
+  //     pdfService.numPages % 2 === 1 &&
+  //     current === pdfService.numPages - 1
+  //   );
+  // }
+
   function isOddFinalSpread(current: number): boolean {
     return (
       !mobile &&
       pdfService.numPages > 1 &&
-      pdfService.numPages % 2 === 1 &&
+      pdfService.numPages % 2 === 0 &&
       current === pdfService.numPages - 1
     );
   }
 
   function spreadStart(current: number): number {
-    if (mobile || isCoverPage(current) || isOddFinalSpread(current)) {
+    if (mobile || isCoverPage(current)) {
       return current;
     }
 
-    return current % 2 === 0 ? current : Math.max(1, current - 1);
+    if (isOddFinalSpread(current)) {
+      return current;
+    }
+
+    return current % 2 === 0 ? current - 1 : current;
   }
 
   function spreadEnd(current: number): number {
@@ -90,13 +103,11 @@
       return current;
     }
 
-    // Untuk PDF ganjil, halaman sebelum sampul belakang tetap menjadi
-    // spread dua halaman: halaman terakhir di kiri dan sisi kanan kosong.
     if (isOddFinalSpread(current)) {
       return pdfService.numPages + 1;
     }
 
-    return current % 2 === 1 ? current : current + 1;
+    return current % 2 === 0 ? current : current + 1;
   }
 
   function nextPage(current: number): number {
@@ -104,16 +115,33 @@
       return flipService.next(current, pdfService.numPages, true);
     }
 
-    // Sisipkan spread terakhir (halaman N-1 + sisi kanan kosong) sebelum
-    // sampul belakang pada PDF dengan jumlah halaman ganjil.
-    if (pdfService.numPages % 2 === 1 && current === pdfService.numPages - 2) {
-      return pdfService.numPages - 1;
-    }
-    if (isOddFinalSpread(current)) {
-      return pdfService.numPages;
+    const total = pdfService.numPages;
+
+    // Sampul depan: buka langsung ke spread halaman 1–2.
+    if (current === 1) {
+      return total > 1 ? 2 : current;
     }
 
-    return flipService.next(current, pdfService.numPages, false);
+    // Sampul belakang tidak bisa dilanjutkan.
+    if (current === total) {
+      return current;
+    }
+
+    // Spread terakhir dengan sisi kanan kosong.
+    if (isOddFinalSpread(current)) {
+      return total;
+    }
+
+    // Menuju halaman terakhir sebelum sampul belakang.
+    if (total % 2 === 0 && current === total - 2) {
+      return total - 1;
+    }
+
+    if (current === total - 1) {
+      return total;
+    }
+
+    return Math.min(current + 2, total);
   }
 
   function previousPage(current: number): number {
@@ -121,14 +149,24 @@
       return flipService.previous(current, pdfService.numPages, true);
     }
 
-    if (pdfService.numPages % 2 === 1 && current === pdfService.numPages) {
-      return pdfService.numPages - 1;
-    }
-    if (isOddFinalSpread(current)) {
-      return pdfService.numPages - 2;
+    const total = pdfService.numPages;
+
+    // Sudah berada di sampul depan.
+    if (current === 1) {
+      return current;
     }
 
-    return flipService.previous(current, pdfService.numPages, false);
+    // Dari sampul belakang kembali ke spread terakhir.
+    if (current === total) {
+      return total - 1;
+    }
+
+    // Dari spread pertama kembali ke sampul depan.
+    if (current === 2) {
+      return 1;
+    }
+
+    return Math.max(current - 2, 1);
   }
 
   // Sampul depan dan belakang tampil sebagai satu halaman di tengah.
@@ -176,7 +214,6 @@
       }
     }
   }
-
   function clearCanvas(canvas: HTMLCanvasElement | null): void {
     if (!canvas) return;
     const context = canvas.getContext("2d");
@@ -189,13 +226,10 @@
     if (!pdfService.isLoaded) {
       return;
     }
-
     loading = true;
     error = "";
-
     try {
       const scale = calculateScale();
-
       if (mobile || isCoverPage(page)) {
         await renderPage(page, rightCanvas, scale);
         if (!mobile && leftCanvas) {
@@ -212,17 +246,13 @@
           await renderPage(right, rightCanvas, scale);
         }
       }
-
       loading = false;
-
       void preloadAround(page, scale);
     } catch (err) {
       loading = false;
-
       if (err instanceof DOMException && err.name === "AbortError") {
         return;
       }
-
       error = err instanceof Error ? err.message : "Gagal merender PDF.";
     }
   }
