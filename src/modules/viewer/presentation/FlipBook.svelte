@@ -4,6 +4,13 @@
   import { PdfService } from "../services/PdfService";
   import { PdfRenderCache } from "../services/PdfRenderCache";
   import type { FlipDirection } from "../types/viewer.types";
+  import {
+    calculateFold,
+    cornerPoint,
+    endPoint,
+    type FoldCorner,
+    type Point,
+  } from "../services/TurnEngine";
 
   interface Props {
     pdfUrl: string;
@@ -45,19 +52,17 @@
   let error = $state("");
   let mobile = $state(false);
 
-  let flipping = $state(false);
-
-  let flipDirection = $state<FlipDirection | null>(null);
-  let flipProgress = $state(0);
-
-  /*
-   * Digunakan supaya halaman depan tidak perlu
-   * dirender ulang hanya untuk memulai gesture.
-   */
-  let preparedDirection = $state<FlipDirection | null>(null);
-
-  let preparingTurn = false;
+  let flipping = false;
   let coverOpening = $state(false);
+
+  // Layer lipatan (diatur langsung lewat style agar tidak memicu reaktivitas).
+  let turnSlot = $state<HTMLDivElement | null>(null);
+  let underBox = $state<HTMLDivElement | null>(null);
+  let underShade = $state<HTMLDivElement | null>(null);
+  let clipLayer = $state<HTMLDivElement | null>(null);
+  let frontLayer = $state<HTMLDivElement | null>(null);
+  let flapLayer = $state<HTMLDivElement | null>(null);
+  let flapShade = $state<HTMLDivElement | null>(null);
 
   function updateMobile(): void {
     mobile = window.matchMedia("(max-width: 767px)").matches;
@@ -222,247 +227,742 @@
     }
   }
 
-  function resetFlip(): void {
-    flipProgress = 0;
-    flipDirection = null;
-    preparedDirection = null;
+  /* =========================================================
+     PAGE CURL (sheet effect)
+
+     Struktur layer (satu "slot" seukuran halaman yang dibalik):
+
+       .turn-slot
+         .turn-under            bayangan di halaman yang terbuka
+         .turn-clip             overflow:hidden, diputar sejajar garis lipat
+           .turn-front          lembar depan (diputar balik -> posisi asli)
+           .turn-flap           sisi belakang kertas (dicerminkan di garis lipat)
+
+     Semua matematika ada di TurnEngine.ts (calculateFold).
+  ========================================================= */
+
+  interface TurnSession {
+    direction: FlipDirection;
+    target: number;
+    side: "left" | "right";
+    corner: FoldCorner;
+    /** Halaman yang tampil di sisi belakang lembar (null = kertas kosong). */
+    backPage: number | null;
+    /** Halaman yang terbuka di bawah lembar (null = kosong). */
+    underPage: number | null;
+    openingCover: boolean;
+    targetSingle: boolean;
+    underCanvas: HTMLCanvasElement;
+    prep: Promise<void> | null;
+    activation: Promise<void> | null;
+    activated: boolean;
+    peeled: boolean;
+    anim: Promise<void> | null;
+    slotW: number;
+    slotH: number;
+    p: Point | null;
   }
 
-  /*
-   * Copy halaman yang sekarang terlihat ke canvas
-   * animasi.
-   *
-   * Ini membuat gesture bisa langsung bergerak
-   * tanpa menunggu PDF.js render ulang.
-   */
+  interface DragState {
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastY: number;
+    prevX: number;
+    prevT: number;
+    vx: number;
+    direction: FlipDirection;
+    cornerV: "t" | "b";
+    started: boolean;
+    starting: Promise<void> | null;
+    session: TurnSession | null;
+    base: Point | null;
+  }
+
+  let session: TurnSession | null = null;
+  let drag: DragState | null = null;
+  let suppressNextClick = false;
+  let hoverKey = "";
+
+  const px = (n: number): string => `${n}px`;
+
+  function easeInOutCubic(t: number): number {
+    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  }
+
   function copyCanvas(
     source: HTMLCanvasElement | null,
     target: HTMLCanvasElement | null,
   ): void {
-    if (!source || !target) {
-      return;
-    }
-
-    if (source.width === 0 || source.height === 0) {
-      return;
-    }
+    if (!source || !target) return;
+    if (source.width === 0 || source.height === 0) return;
 
     target.width = source.width;
     target.height = source.height;
 
     const context = target.getContext("2d");
-
-    if (!context) {
-      return;
-    }
+    if (!context) return;
 
     context.clearRect(0, 0, target.width, target.height);
-
     context.drawImage(source, 0, 0);
   }
 
-  /*
-   * Menyiapkan dua sisi halaman flip.
-   */
-  async function prepareTurn(direction: FlipDirection): Promise<void> {
-    if (preparingTurn) {
-      return;
-    }
+  function paint(
+    canvas: HTMLCanvasElement | null,
+    source: HTMLCanvasElement | null,
+  ): void {
+    if (source) copyCanvas(source, canvas);
+    else clearCanvas(canvas);
+  }
 
+  function frontCanvasFor(s: TurnSession): HTMLCanvasElement | null {
+    if (mobile || isCoverPage(page)) return rightCanvas;
+    return s.side === "right" ? rightCanvas : leftCanvas;
+  }
+
+  function planTurn(
+    direction: FlipDirection,
+    cornerV: "t" | "b",
+  ): TurnSession | null {
+    if (!pdfService.isLoaded) return null;
+
+    const total = pdfService.numPages;
     const target = direction === "next" ? nextPage(page) : previousPage(page);
+    if (target === page || target < 1 || target > total) return null;
 
-    if (target === page) {
-      return;
+    const inRange = (n: number): number | null =>
+      n >= 1 && n <= total ? n : null;
+
+    const openingCover =
+      !mobile &&
+      ((page === 1 && direction === "next") ||
+        (page === total && direction === "previous"));
+    const targetSingle = mobile || isCoverPage(target);
+    const side: "left" | "right" = direction === "next" ? "right" : "left";
+
+    let backPage: number | null;
+    let underPage: number | null;
+
+    if (mobile) {
+      // Mode satu halaman: sisi belakang kertas kosong, halaman tujuan
+      // langsung terlihat di bawah lembar.
+      backPage = null;
+      underPage = target;
+    } else if (direction === "next") {
+      // Lembar kanan dibalik: sisi belakangnya = halaman kiri spread tujuan,
+      // halaman yang terbuka di bawahnya = halaman kanan spread tujuan.
+      backPage = inRange(spreadStart(target));
+      underPage = targetSingle ? null : inRange(spreadEnd(target));
+    } else {
+      backPage = inRange(spreadEnd(target));
+      underPage = targetSingle ? null : inRange(spreadStart(target));
     }
 
-    preparingTurn = true;
+    return {
+      direction,
+      target,
+      side,
+      corner: `${cornerV}${side === "right" ? "r" : "l"}` as FoldCorner,
+      backPage,
+      underPage,
+      openingCover,
+      targetSingle,
+      underCanvas: document.createElement("canvas"),
+      prep: null,
+      activation: null,
+      activated: false,
+      peeled: false,
+      anim: null,
+      slotW: 0,
+      slotH: 0,
+      p: null,
+    };
+  }
 
+  /** Render sisi belakang + halaman di bawah lembar; belum mengubah tampilan. */
+  async function prepareSession(s: TurnSession): Promise<void> {
+    copyCanvas(frontCanvasFor(s), turnFrontCanvas);
+
+    const scale = calculateScale();
+    const tasks: Promise<void>[] = [];
+
+    if (s.backPage !== null) {
+      tasks.push(renderPage(s.backPage, turnBackCanvas, scale));
+    } else {
+      clearCanvas(turnBackCanvas);
+    }
+    if (s.underPage !== null) {
+      tasks.push(renderPage(s.underPage, s.underCanvas, scale));
+    }
+    await Promise.all(tasks);
+  }
+
+  async function ensureSession(
+    direction: FlipDirection,
+    cornerV: "t" | "b",
+  ): Promise<TurnSession | null> {
+    if (session && session.direction !== direction) {
+      if (session.anim) return null;
+      restoreTurn(session);
+    }
+
+    if (!session) session = planTurn(direction, cornerV);
+    const s = session;
+    if (!s) return null;
+
+    if (!s.activated) {
+      s.corner = `${cornerV}${s.side === "right" ? "r" : "l"}` as FoldCorner;
+    }
+    s.prep ??= prepareSession(s);
     try {
-      /*
-       * FRONT
-       *
-       * Next:
-       *   halaman kanan
-       *
-       * Previous:
-       *   halaman kiri
-       */
-      const frontCanvas =
-        mobile || isCoverPage(page)
-          ? rightCanvas
-          : direction === "next"
-            ? rightCanvas
-            : leftCanvas;
-
-      copyCanvas(frontCanvas, turnFrontCanvas);
-
-      /*
-       * BACK
-       *
-       * Render halaman tujuan.
-       */
-      // Saat membuka sampul depan, sisi belakang sampul adalah halaman 2,
-      // sementara spread yang terbuka akan berisi halaman 2 dan 3.
-      const openingFrontCover = !mobile && page === 1 && direction === "next";
-      const openingBackCover =
-        !mobile && page === pdfService.numPages && direction === "previous";
-
-      // Sisi dalam sampul berisi halaman yang menempel pada sampul:
-      // halaman 2 saat membuka sampul depan, atau halaman N-1 saat
-      // membuka sampul belakang.
-      const backPage = openingFrontCover
-        ? Math.max(1, target - 1)
-        : openingBackCover
-          ? Math.min(pdfService.numPages, target + 1)
-          : target;
-
-      await renderPage(backPage, turnBackCanvas, calculateScale());
-
-      preparedDirection = direction;
-    } finally {
-      preparingTurn = false;
+      await s.prep;
+    } catch (err) {
+      if (session === s) session = null;
+      throw err;
     }
+
+    return session === s ? s : null;
   }
 
-  /*
-   * Ease-out untuk animasi ketika gesture dilepas.
-   */
-  // Smoothstep quintic: akselerasi dan deselerasi lebih lembut,
-  // tanpa perubahan kecepatan yang terasa mendadak di awal/akhir.
-  function easeInOutQuint(value: number): number {
-    return value < 0.5
-      ? 16 * value * value * value * value * value
-      : 1 - Math.pow(-2 * value + 2, 5) / 2;
+  function slotElement(
+    s: TurnSession,
+    spread: HTMLElement,
+  ): HTMLElement | null {
+    if (mobile) {
+      return (
+        spread.querySelector<HTMLElement>(".single-page") ??
+        spread.querySelector<HTMLElement>(".page-sheet")
+      );
+    }
+    return spread.querySelector<HTMLElement>(
+      s.side === "right" ? ".right-page" : ".left-page",
+    );
   }
 
-  /*
-   * Animasi progress dari posisi sekarang
-   * menuju target.
-   */
-  async function animateTo(target: number, duration: number): Promise<void> {
-    const start = flipProgress;
+  /** Posisikan slot tepat di atas halaman yang dibalik (area isi, tanpa border). */
+  function measureSlot(s: TurnSession): boolean {
+    const spread = host?.querySelector<HTMLElement>(".book-spread");
+    if (!spread || !turnSlot) return false;
+    const el = slotElement(s, spread);
+    if (!el) return false;
 
-    const delta = target - start;
+    const sr = spread.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    const bx = el.clientLeft;
+    const by = el.clientTop;
+    const w = Math.max(1, r.width - bx * 2);
+    const h = Math.max(1, r.height - by * 2);
 
-    const started = performance.now();
+    turnSlot.style.left = px(r.left + bx - sr.left);
+    turnSlot.style.top = px(r.top + by - sr.top);
+    turnSlot.style.width = px(w);
+    turnSlot.style.height = px(h);
+    s.slotW = w;
+    s.slotH = h;
+    return true;
+  }
 
-    await new Promise<void>((resolve) => {
+  function setBox(
+    el: HTMLElement | null,
+    w: number,
+    h: number,
+    transform: string,
+  ): void {
+    if (!el) return;
+    el.style.width = px(w);
+    el.style.height = px(h);
+    el.style.transform = transform;
+  }
+
+  /** Terapkan satu frame lipatan untuk titik pojok `point`. */
+  function renderFold(s: TurnSession, point: Point): void {
+    if (!measureSlot(s)) return;
+    const W = s.slotW;
+    const H = s.slotH;
+    const right = s.corner[1] === "r";
+    const bottom = s.corner[0] === "b";
+    const c = cornerPoint(s.corner, W, H);
+
+    // Pojok hanya boleh bergerak ke arah dalam halaman.
+    let x = right ? Math.min(point.x, c.x) : Math.max(point.x, c.x);
+    let y = bottom ? Math.min(point.y, c.y) : Math.max(point.y, c.y);
+    if (Math.hypot(x - c.x, y - c.y) < 1) {
+      x = c.x + (right ? -0.8 : 0.8);
+      y = c.y + (bottom ? -0.8 : 0.8);
+    }
+
+    const g = calculateFold({
+      width: W,
+      height: H,
+      corner: s.corner,
+      point: { x, y },
+    });
+    s.p = g.point;
+
+    if (clipLayer) {
+      clipLayer.style.width = px(g.clipWidth);
+      clipLayer.style.height = px(g.clipHeight);
+      clipLayer.style.transform = g.clip;
+    }
+    setBox(frontLayer, W, H, g.front);
+    setBox(flapLayer, W, H, g.flap);
+    setBox(
+      flapShade,
+      g.flapShade.width,
+      g.flapShade.height,
+      g.flapShade.transform,
+    );
+    setBox(underBox, W, H, "none");
+    setBox(
+      underShade,
+      g.underShade.width,
+      g.underShade.height,
+      g.underShade.transform,
+    );
+
+    if (flapShade) flapShade.style.opacity = String(g.strength);
+    if (underShade) underShade.style.opacity = String(g.strength);
+  }
+
+  function animateFold(
+    s: TurnSession,
+    from: Point,
+    to: Point,
+    duration: number,
+    lift: number,
+  ): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const started = performance.now();
       const frame = (now: number) => {
-        const elapsed = now - started;
-
-        const t = Math.min(1, elapsed / duration);
-
-        const eased = easeInOutQuint(t);
-
-        flipProgress = start + delta * eased;
-
-        if (t < 1) {
-          requestAnimationFrame(frame);
-        } else {
-          resolve();
-        }
+        const t = Math.min(1, Math.max(0, (now - started) / duration));
+        const e = easeInOutCubic(t);
+        renderFold(s, {
+          x: from.x + (to.x - from.x) * e,
+          y: from.y + (to.y - from.y) * e + lift * Math.sin(Math.PI * e),
+        });
+        if (t < 1) requestAnimationFrame(frame);
+        else resolve();
       };
-
       requestAnimationFrame(frame);
     });
   }
 
-  async function commitFlip(direction: FlipDirection): Promise<void> {
-    if (flipping || !pdfService.isLoaded) return;
-
-    const target = direction === "next" ? nextPage(page) : previousPage(page);
-
-    if (target === page) {
-      resetFlip();
-      return;
+  async function runAnim(
+    s: TurnSession,
+    job: () => Promise<void>,
+  ): Promise<void> {
+    const promise = job();
+    s.anim = promise;
+    try {
+      await promise;
+    } finally {
+      if (s.anim === promise) s.anim = null;
     }
+  }
 
-    // Kedua sampul memakai gerakan fisik yang sama: sampul berputar
-    // dari punggung buku dan spread tujuan sudah terlihat di bawahnya.
-    const openingCover =
-      !mobile &&
-      ((page === 1 && direction === "next") ||
-        (page === pdfService.numPages && direction === "previous"));
-    const scale = calculateScale();
+  async function settle(s: TurnSession): Promise<void> {
+    while (s.anim) await s.anim;
+  }
+
+  /** Tampilkan lembar yang bisa dibalik dan ganti halaman di bawahnya. */
+  function activateTurn(s: TurnSession): Promise<void> {
+    s.activation ??= (async () => {
+      if (s.openingCover) {
+        coverOpening = true;
+        await tick();
+      }
+
+      const under = s.underPage !== null ? s.underCanvas : null;
+
+      if (mobile) {
+        paint(rightCanvas, under);
+      } else if (s.openingCover) {
+        // Sampul membuka spread: sisi yang baru terbuka tetap putih
+        // sampai lembar mendarat di atasnya.
+        if (s.direction === "next") {
+          clearCanvas(leftCanvas);
+          paint(rightCanvas, under);
+        } else {
+          paint(leftCanvas, under);
+          clearCanvas(rightCanvas);
+        }
+      } else if (s.direction === "next") {
+        paint(rightCanvas, under);
+      } else {
+        paint(leftCanvas, under);
+      }
+
+      measureSlot(s);
+      if (turnSlot) turnSlot.style.display = "block";
+      renderFold(s, cornerPoint(s.corner, s.slotW, s.slotH));
+      s.activated = true;
+    })();
+    return s.activation;
+  }
+
+  function hideTurn(): void {
+    if (turnSlot) turnSlot.style.display = "none";
+  }
+
+  /** Batalkan lipatan: kembalikan halaman asli ke canvas dan buang sesi. */
+  function restoreTurn(s: TurnSession): void {
+    if (s.activated) copyCanvas(turnFrontCanvas, frontCanvasFor(s));
+    coverOpening = false;
+    hideTurn();
+    if (session === s) session = null;
+  }
+
+  /** Buang sesi tanpa menggambar ulang (dipakai sebelum render ulang). */
+  function dropSession(): void {
+    hideTurn();
+    session = null;
+    drag = null;
+    coverOpening = false;
+  }
+
+  function applyFinalCanvases(s: TurnSession): void {
+    if (mobile) return;
+
+    const back = s.backPage !== null ? turnBackCanvas : null;
+
+    if (s.targetSingle) {
+      paint(rightCanvas, back);
+      clearCanvas(leftCanvas);
+    } else if (s.direction === "next") {
+      paint(leftCanvas, back);
+    } else {
+      paint(rightCanvas, back);
+    }
+  }
+
+  async function finishTurn(s: TurnSession): Promise<void> {
+    applyFinalCanvases(s);
+
+    skipNextPageRender = true;
+    onPageChange(s.target);
+    await tick();
+
+    hideTurn();
+    session = null;
+    coverOpening = false;
+    void preloadAround(s.target, calculateScale());
+  }
+
+  /** Animasikan lembar hingga terbalik sepenuhnya. */
+  async function runFlip(s: TurnSession): Promise<void> {
+    if (flipping) return;
     flipping = true;
     error = "";
 
     try {
-      // Salin sampul ke layer animasi terlebih dahulu. Saat membuka sampul,
-      // siapkan spread halaman 2–3 di belakangnya sebelum animasi dimulai.
-      await prepareTurn(direction);
+      await settle(s);
+      await activateTurn(s);
+      measureSlot(s);
 
-      if (preparedDirection !== direction) {
-        await prepareTurn(direction);
-      }
+      const W = s.slotW;
+      const H = s.slotH;
+      const from = s.p ?? cornerPoint(s.corner, W, H);
+      const to = endPoint(s.corner, W, H);
+      const remaining = Math.min(1, Math.abs(to.x - from.x) / (2 * W));
+      const duration = (s.openingCover ? 1500 : 950) * (0.4 + 0.6 * remaining);
+      const lift = (s.corner[0] === "b" ? -1 : 1) * H * 0.2 * remaining;
 
-      if (openingCover) {
-        coverOpening = true;
-        await tick();
-        const targetLeft = spreadStart(target);
-        const targetRight = spreadEnd(target);
-        await renderPage(targetLeft, leftCanvas, scale);
-        if (targetRight > pdfService.numPages) {
-          clearCanvas(rightCanvas);
-        } else {
-          await renderPage(targetRight, rightCanvas, scale);
-        }
-      }
-
-      // Baru tampilkan layer flip setelah canvas depan/belakang dan spread
-      // di bawahnya siap, supaya tidak ada frame kosong atau loncatan awal.
-      flipDirection = direction;
-      flipProgress = 0;
-      await tick();
-      // Pembukaan sampul depan dan belakang dibuat lebih lambat agar transisi
-      // dari satu halaman ke spread dua halaman terasa bertahap dan natural.
-      // Kedua arah memakai durasi yang sama supaya gerakannya konsisten.
-      await animateTo(1, openingCover ? 1550 : 920);
-
-      if (mobile || isCoverPage(target)) {
-        await renderPage(target, rightCanvas, scale);
-        if (!mobile && leftCanvas) clearCanvas(leftCanvas);
-      } else {
-        const targetLeft = spreadStart(target);
-        const targetRight = spreadEnd(target);
-        await renderPage(targetLeft, leftCanvas, scale);
-        if (targetRight > pdfService.numPages) {
-          clearCanvas(rightCanvas);
-        } else {
-          await renderPage(targetRight, rightCanvas, scale);
-        }
-      }
-
-      skipNextPageRender = true;
-      onPageChange(target);
-      await tick();
-
-      resetFlip();
-      coverOpening = false;
-      flipping = false;
-      void preloadAround(target, scale);
+      await runAnim(s, () => animateFold(s, from, to, duration, lift));
+      await finishTurn(s);
     } catch (err) {
-      resetFlip();
-      coverOpening = false;
+      dropSession();
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        error = err instanceof Error ? err.message : "Gagal membalik halaman.";
+      }
+      void renderCurrent();
+    } finally {
       flipping = false;
+    }
+  }
+
+  /** Kembalikan lembar ke posisi semula. */
+  async function runCancel(s: TurnSession): Promise<void> {
+    if (flipping) return;
+    flipping = true;
+    try {
+      await settle(s);
+      measureSlot(s);
+      const c = cornerPoint(s.corner, s.slotW, s.slotH);
+      const from = s.p ?? c;
+      const away = Math.min(1, Math.abs(from.x - c.x) / s.slotW);
+      await runAnim(s, () => animateFold(s, from, c, 240 + 260 * away, 0));
+      restoreTurn(s);
+    } finally {
+      flipping = false;
+    }
+  }
+
+  async function commitFlip(
+    direction: FlipDirection,
+    cornerV: "t" | "b" = "b",
+  ): Promise<void> {
+    if (flipping || !pdfService.isLoaded) return;
+    try {
+      const s = await ensureSession(direction, cornerV);
+      if (!s) return;
+      await runFlip(s);
+    } catch (err) {
+      dropSession();
       if (!(err instanceof DOMException && err.name === "AbortError")) {
         error = err instanceof Error ? err.message : "Gagal membalik halaman.";
       }
     }
   }
 
-  async function cancelFlip(): Promise<void> {
-    if (flipping || flipProgress <= 0) {
-      resetFlip();
+  /* ---------- Hover: sudut halaman terangkat sedikit (seperti Turn.js) ---------- */
+
+  function cornerHit(
+    event: PointerEvent,
+  ): { direction: FlipDirection; cornerV: "t" | "b" } | null {
+    if (mobile || coverOpening || isCoverPage(page)) return null;
+    const spread = host?.querySelector<HTMLElement>(".book-spread");
+    if (!spread) return null;
+
+    const r = spread.getBoundingClientRect();
+    const x = event.clientX - r.left;
+    const y = event.clientY - r.top;
+    if (x < 0 || y < 0 || x > r.width || y > r.height) return null;
+
+    const zone = Math.min(72, r.width * 0.07);
+    const cornerV = y < zone ? "t" : y > r.height - zone ? "b" : null;
+    if (!cornerV) return null;
+
+    if (x > r.width - zone) return { direction: "next", cornerV };
+    if (x < zone) return { direction: "previous", cornerV };
+    return null;
+  }
+
+  async function startPeel(
+    direction: FlipDirection,
+    cornerV: "t" | "b",
+    key: string,
+  ): Promise<void> {
+    const s = await ensureSession(direction, cornerV);
+    if (!s || s.peeled || s.anim || flipping || drag || hoverKey !== key)
+      return;
+
+    await activateTurn(s);
+    if (session !== s || hoverKey !== key) return;
+
+    s.peeled = true;
+    const W = s.slotW;
+    const H = s.slotH;
+    const c = cornerPoint(s.corner, W, H);
+    const to = {
+      x: c.x + (s.corner[1] === "r" ? -1 : 1) * Math.min(46, W * 0.1),
+      y: c.y + (s.corner[0] === "b" ? -1 : 1) * Math.min(36, H * 0.05),
+    };
+    await runAnim(s, () => animateFold(s, c, to, 220, 0));
+  }
+
+  async function endPeel(): Promise<void> {
+    const s = session;
+    if (!s || !s.peeled || flipping || drag) return;
+    s.peeled = false;
+    await settle(s);
+    if (session !== s || flipping || drag) return;
+
+    const c = cornerPoint(s.corner, s.slotW, s.slotH);
+    await runAnim(s, () => animateFold(s, s.p ?? c, c, 200, 0));
+    if (session === s && !s.peeled && !drag && !flipping) restoreTurn(s);
+  }
+
+  /* ---------- Drag ---------- */
+
+  function pressTarget(
+    event: PointerEvent | MouseEvent,
+  ): { direction: FlipDirection; cornerV: "t" | "b" } | null {
+    const spread = host?.querySelector<HTMLElement>(".book-spread");
+    if (!spread) return null;
+    const rect = spread.getBoundingClientRect();
+
+    let direction: FlipDirection;
+    if (mobile || isCoverPage(page)) {
+      const sheet = spread.querySelector<HTMLElement>(".page-sheet");
+      const sr = sheet?.getBoundingClientRect();
+      if (!sr || event.clientX < sr.left || event.clientX > sr.right)
+        return null;
+      direction = event.clientX >= sr.left + sr.width / 2 ? "next" : "previous";
+    } else {
+      direction =
+        event.clientX >= rect.left + rect.width / 2 ? "next" : "previous";
+    }
+
+    const cornerV = event.clientY < rect.top + rect.height / 2 ? "t" : "b";
+    return { direction, cornerV };
+  }
+
+  function updateDrag(d: DragState): void {
+    const s = d.session;
+    if (!s || !d.base) return;
+    renderFold(s, {
+      x: d.base.x + (d.lastX - d.startX),
+      y: d.base.y + (d.lastY - d.startY),
+    });
+  }
+
+  function onBookPointerDown(event: PointerEvent): void {
+    if (event.button !== 0 || flipping || loading || !pdfService.isLoaded)
+      return;
+
+    const hit = pressTarget(event);
+    if (!hit) return;
+
+    drag = {
+      startX: event.clientX,
+      startY: event.clientY,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      prevX: event.clientX,
+      prevT: performance.now(),
+      vx: 0,
+      direction: hit.direction,
+      cornerV: hit.cornerV,
+      started: false,
+      starting: null,
+      session: null,
+      base: null,
+    };
+
+    try {
+      host?.setPointerCapture(event.pointerId);
+    } catch {
+      /* pointer capture is optional */
+    }
+
+    // Siapkan sisi belakang lembar sejak pointer menekan, sebelum drag dimulai.
+    void ensureSession(hit.direction, hit.cornerV).catch(() => {});
+  }
+
+  function onBookPointerMove(event: PointerEvent): void {
+    const d = drag;
+
+    if (!d) {
+      if (event.pointerType !== "mouse" || flipping || loading) return;
+      const hit = cornerHit(event);
+      if (!hit) {
+        hoverKey = "";
+        void endPeel();
+        return;
+      }
+      const key = `${hit.direction}${hit.cornerV}`;
+      if (key === hoverKey) return;
+      hoverKey = key;
+      if (session?.peeled) {
+        void endPeel().then(() => {
+          if (hoverKey === key) void startPeel(hit.direction, hit.cornerV, key);
+        });
+      } else {
+        void startPeel(hit.direction, hit.cornerV, key).catch(() => {});
+      }
       return;
     }
 
-    await animateTo(0, 420);
+    if (flipping) return;
 
-    resetFlip();
+    const now = performance.now();
+    const dt = Math.max(1, now - d.prevT);
+    d.vx = 0.6 * d.vx + 0.4 * ((event.clientX - d.prevX) / dt);
+    d.prevX = event.clientX;
+    d.prevT = now;
+    d.lastX = event.clientX;
+    d.lastY = event.clientY;
+
+    if (!d.started) {
+      const dx = event.clientX - d.startX;
+      const dy = event.clientY - d.startY;
+      const towardSpine = d.direction === "next" ? dx < -6 : dx > 6;
+      if (!towardSpine || Math.abs(dx) < Math.abs(dy) * 0.8) return;
+
+      d.started = true;
+      d.starting = (async () => {
+        const s = await ensureSession(d.direction, d.cornerV);
+        if (!s || drag !== d) return;
+        await settle(s);
+        await activateTurn(s);
+        if (drag !== d) return;
+        measureSlot(s);
+        d.base =
+          s.peeled && s.p
+            ? { ...s.p }
+            : cornerPoint(s.corner, s.slotW, s.slotH);
+        s.peeled = false;
+        d.session = s;
+        updateDrag(d);
+      })().catch(() => {
+        drag = null;
+      });
+      return;
+    }
+
+    updateDrag(d);
+  }
+
+  async function finishDrag(d: DragState): Promise<void> {
+    await d.starting;
+    const s = d.session;
+    if (drag === d) drag = null;
+    if (!s || session !== s) return;
+
+    const W = Math.max(1, s.slotW);
+    const c = cornerPoint(s.corner, W, s.slotH);
+    const moved = Math.abs((s.p?.x ?? c.x) - c.x) / W;
+    const flick = d.direction === "next" ? d.vx < -0.6 : d.vx > 0.6;
+
+    if (moved > 0.4 || (flick && moved > 0.08)) await runFlip(s);
+    else await runCancel(s);
+  }
+
+  function onBookPointerUp(event: PointerEvent): void {
+    const d = drag;
+    try {
+      host?.releasePointerCapture(event.pointerId);
+    } catch {
+      /* ignore */
+    }
+    if (!d) return;
+
+    if (!d.started) {
+      drag = null;
+      return;
+    }
+
+    suppressNextClick = true;
+    void finishDrag(d);
+  }
+
+  function onBookPointerCancel(): void {
+    const d = drag;
+    if (!d) return;
+    if (!d.started) {
+      drag = null;
+      return;
+    }
+    d.vx = 0;
+    suppressNextClick = true;
+    void (async () => {
+      await d.starting;
+      const s = d.session;
+      if (drag === d) drag = null;
+      if (s && session === s) await runCancel(s);
+    })();
+  }
+
+  function onBookPointerLeave(): void {
+    hoverKey = "";
+    void endPeel();
   }
 
   function onBookClick(event: MouseEvent): void {
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      return;
+    }
     if (flipping || loading || !pdfService.isLoaded) {
       return;
     }
@@ -476,6 +976,10 @@
       return;
     }
 
+    const rect = spread.getBoundingClientRect();
+    const cornerV: "t" | "b" =
+      event.clientY < rect.top + rect.height / 2 ? "t" : "b";
+
     // Pada sampul (halaman tunggal), spread masih selebar area buku.
     // Gunakan posisi halaman yang benar agar klik sebelumnya tidak jatuh
     // pada area kosong di sisi kiri/kanan spread.
@@ -488,23 +992,24 @@
 
       if (x < 0 || x > pageRect.width) return;
 
-      if (x <= pageRect.width * 0.35) {
-        void commitFlip("previous");
-      } else if (x >= pageRect.width * 0.65) {
-        void commitFlip("next");
+      if (x <= pageRect.width * 0.46) {
+        void commitFlip("previous", cornerV);
+      } else if (x >= pageRect.width * 0.54) {
+        void commitFlip("next", cornerV);
       }
       return;
     }
 
-    const rect = spread.getBoundingClientRect();
     const x = event.clientX - rect.left;
-    const edgeWidth = Math.min(100, rect.width * 0.18);
 
-    // Pada spread normal, klik hanya bekerja pada tepi luar buku.
-    if (x <= edgeWidth) {
-      void commitFlip("previous");
-    } else if (x >= rect.width - edgeWidth) {
-      void commitFlip("next");
+    // Area kecil di sekitar punggung buku tidak memicu navigasi.
+    const spineTolerance = Math.min(12, rect.width * 0.015);
+    const center = rect.width / 2;
+
+    if (x < center - spineTolerance) {
+      void commitFlip("previous", cornerV);
+    } else if (x > center + spineTolerance) {
+      void commitFlip("next", cornerV);
     }
   }
 
@@ -587,6 +1092,7 @@
     }
 
     if (pdfService.isLoaded && !flipping) {
+      dropSession();
       void renderCurrent();
     }
   });
@@ -600,7 +1106,12 @@
 <div
   bind:this={host}
   role="application"
-  class="relative flex h-full min-h-0 w-full select-none items-center justify-center overflow-hidden"
+  class="relative flex h-full min-h-0 w-full select-none items-center justify-center overflow-hidden [touch-action:pan-y]"
+  onpointerdown={onBookPointerDown}
+  onpointerup={onBookPointerUp}
+  onpointermove={onBookPointerMove}
+  onpointercancel={onBookPointerCancel}
+  onpointerleave={onBookPointerLeave}
   onclick={onBookClick}
 >
   <div
@@ -647,29 +1158,28 @@
               <div class="page-edge"></div>
             </div>
 
-            <div
-              class:next={flipDirection === "next"}
-              class:previous={flipDirection === "previous"}
-              class:single-turn={mobile || (isCoverPage(page) && !coverOpening)}
-              class:cover-turn={coverOpening &&
-                !(page === pdfService.numPages && flipDirection === "previous")}
-              class:back-cover-turn={coverOpening &&
-                page === pdfService.numPages &&
-                flipDirection === "previous"}
-              class:inactive={!flipDirection ||
-                flipProgress <= 0 ||
-                coverOpening}
-              class="turning-page"
-              style={`--progress:${flipProgress}; --flip-shadow:${Math.sin(flipProgress * Math.PI)};`}
-            >
-              <!-- FRONT -->
-              <div class="turn-face front">
-                <canvas bind:this={turnFrontCanvas}></canvas>
+            <!--
+              Slot lipatan: JS memposisikannya tepat di atas halaman yang
+              sedang dibalik. Tersembunyi saat tidak ada gerakan.
+            -->
+            <div class="turn-slot" bind:this={turnSlot} aria-hidden="true">
+              <div class="turn-under" bind:this={underBox}>
+                <div class="turn-under-shade" bind:this={underShade}></div>
               </div>
 
-              <!-- BACK -->
-              <div class="turn-face back">
-                <canvas bind:this={turnBackCanvas}></canvas>
+              <div class="turn-clip" bind:this={clipLayer}>
+                <!-- Lembar depan: halaman yang terlihat sebelum dibalik -->
+                <div class="turn-front" bind:this={frontLayer}>
+                  <canvas bind:this={turnFrontCanvas}></canvas>
+                </div>
+
+                <!-- Sisi belakang kertas, dicerminkan di garis lipat -->
+                <div class="turn-flap" bind:this={flapLayer}>
+                  <div class="turn-flap-back">
+                    <canvas bind:this={turnBackCanvas}></canvas>
+                  </div>
+                  <div class="turn-flap-shade" bind:this={flapShade}></div>
+                </div>
               </div>
             </div>
           </div>
@@ -709,7 +1219,9 @@
     position: relative;
     isolation: isolate;
     container-type: size;
-    perspective: 2600px;
+    /* Perspektif 3D agar lembar terasa terangkat saat dibuka. */
+    perspective: 950px;
+    perspective-origin: 50% 45%;
     width: min(100%, 1760px);
     height: min(100%, 1180px);
     min-width: 0;
@@ -763,11 +1275,12 @@
     position: absolute;
     inset: 0;
     border-radius: inherit;
-    background: radial-gradient(
+    /* background: radial-gradient(
       ellipse at 50% 42%,
       rgba(148, 163, 184, 0.12),
       transparent 62%
-    );
+    ); */
+    background: #ffffff;
     pointer-events: none;
   }
 
@@ -851,8 +1364,9 @@
   /* Paksa canvas mengikuti kotak halaman.
      Ukuran bitmap internal tetap dikelola oleh PdfService. */
 
-  .page-sheet canvas,
-  .turn-face canvas {
+  .page-sheet canvas {
+    position: relative;
+    z-index: 1;
     display: block;
     width: 100% !important;
     height: 100% !important;
@@ -952,11 +1466,11 @@
     pointer-events: none;
     background: linear-gradient(
       90deg,
-      rgba(15, 23, 42, 0.2),
-      rgba(15, 23, 42, 0.04) 28%,
-      rgba(255, 255, 255, 0.2) 50%,
-      rgba(15, 23, 42, 0.1) 72%,
-      rgba(15, 23, 42, 0.2)
+      rgba(15, 23, 42, 0.3),
+      rgba(15, 23, 42, 0.06) 28%,
+      rgba(255, 255, 255, 0.24) 50%,
+      rgba(15, 23, 42, 0.16) 72%,
+      rgba(15, 23, 42, 0.3)
     );
   }
 
@@ -984,144 +1498,97 @@
   }
 
   /* =========================================================
-     PAGE FLIP ANIMATION
+     PAGE CURL
+     Semua transform/ukuran layer diatur oleh TurnEngine lewat JS.
+     Setiap layer memakai transform-origin 0 0.
   ========================================================= */
 
-  .turning-page {
+  .turn-slot {
     position: absolute;
+    left: 0;
     top: 0;
-    bottom: 0;
-    width: 50%;
     z-index: 20;
+    display: none;
     overflow: visible;
-    transform-style: preserve-3d;
-    will-change: transform;
     pointer-events: none;
-    backface-visibility: visible;
   }
 
-  .turning-page.inactive {
-    visibility: hidden;
-  }
-
-  .turning-page.single-turn {
-    width: 100%;
-    left: 0;
-    right: 0;
-  }
-
-  .turning-page.single-turn.next {
-    left: auto;
-    right: 0;
-    width: 100%;
-    transform-origin: right center;
-  }
-
-  .turning-page.single-turn.previous {
-    left: 0;
-    right: auto;
-    width: 100%;
-    transform-origin: left center;
-  }
-
-  .turning-page.next {
-    right: 0;
-    transform-origin: left center;
-    transform: translateZ(12px) rotateY(calc(-180deg * var(--progress)));
-  }
-
-  .turning-page.previous {
-    left: 0;
-    transform-origin: right center;
-    transform: translateZ(12px) rotateY(calc(180deg * var(--progress)));
-  }
-
-  /* Sampul depan berputar dari punggung buku, seperti membuka cover fisik. */
-  .book-spread:not(.single) .turning-page.next {
-    right: 0;
-    width: 50%;
-    transform-origin: left center;
-    transform: translateZ(14px) rotateY(calc(-180deg * var(--progress)));
-  }
-
-  /*
-   * Sampul belakang dibuka dengan mekanika yang sama seperti sampul depan.
-   * Walaupun aksi navigasinya "previous", sampul tetap berada di sisi kanan
-   * spread dan berputar dari punggung buku. Ini mencegah animasi menyapu
-   * halaman kiri atau terlihat seperti membalik halaman biasa.
-   */
-  .book-spread:not(.single) .turning-page.cover-turn {
-    left: auto;
-    right: 0;
-    width: 50%;
-    transform-origin: left center;
-    transform: translateZ(14px) rotateY(calc(-180deg * var(--progress)));
-  }
-
-  /*
-   * Sampul belakang bergerak dengan arah kebalikan dari sampul depan.
-   * Saat pengguna kembali dari halaman terakhir, sampul berada di sisi kiri
-   * dan berputar dari punggung kanan ke arah kiri-ke-kanan, membuka spread
-   * halaman sebelumnya di bawahnya.
-   */
-  .book-spread:not(.single) .turning-page.back-cover-turn {
-    left: 0;
-    right: auto;
-    width: 50%;
-    transform-origin: right center;
-    transform: translateZ(14px) rotateY(calc(180deg * var(--progress)));
-  }
-
-  .turn-face {
+  .turn-under {
     position: absolute;
-    inset: 0;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
     overflow: hidden;
-    background: #fff;
-    backface-visibility: hidden;
-    transform-style: preserve-3d;
-    box-shadow:
-      0 0 10px rgba(0, 0, 0, 0.16),
-      inset 0 0 0 1px rgba(15, 23, 42, 0.1);
   }
 
-  /* Bayangan bergerak mengikuti lipatan, bukan hanya menempel statis. */
-  .turn-face::after {
-    content: "";
+  /* Bayangan di halaman yang terbuka, tepat di sebelah garis lipat. */
+  .turn-under-shade {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: 0 0;
+    background: linear-gradient(
+      to right,
+      rgba(15, 23, 42, 0),
+      rgba(15, 23, 42, 0.34)
+    );
+  }
+
+  /* Kotak pemotong: overflow hidden inilah yang membuat potongan diagonal. */
+  .turn-clip {
+    position: absolute;
+    left: 0;
+    top: 0;
+    overflow: hidden;
+    transform-origin: 0 0;
+    will-change: transform;
+  }
+
+  .turn-front,
+  .turn-flap {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: 0 0;
+    background: #fff;
+  }
+
+  .turn-flap {
+    overflow: hidden;
+    box-shadow: 0 0 16px rgba(15, 23, 42, 0.42);
+  }
+
+  /* Sisi belakang dicerminkan horizontal; pencerminan di garis lipat
+     oleh transform .turn-flap membuatnya terbaca normal. */
+  .turn-flap-back {
     position: absolute;
     inset: 0;
+    background: #fff;
+    transform: scaleX(-1);
+  }
+
+  /* Gelap di dekat garis lipat, sedikit pantulan di tengah lipatan. */
+  .turn-flap-shade {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: 0 0;
     pointer-events: none;
-    opacity: calc(var(--flip-shadow, 0) * 0.72);
-    transition: none;
-  }
-
-  .turn-face.front::after {
     background: linear-gradient(
-      90deg,
-      rgba(15, 23, 42, 0.02) 0%,
-      rgba(15, 23, 42, 0.03) 48%,
-      rgba(15, 23, 42, 0.42) 100%
+      to right,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.2) 50%,
+      rgba(15, 23, 42, 0.3) 100%
     );
   }
 
-  .turn-face.back::after {
-    background: linear-gradient(
-      90deg,
-      rgba(15, 23, 42, 0.36) 0%,
-      rgba(15, 23, 42, 0.08) 34%,
-      rgba(255, 255, 255, 0.02) 100%
-    );
-  }
-
-  .turn-face.front {
-    border-radius: 2px 0 0 2px;
-  }
-
-  .turn-face.back {
-    transform: rotateY(180deg);
-    border-radius: 0 2px 2px 0;
-    box-shadow:
-      inset 0 0 18px rgba(15, 23, 42, 0.1),
-      0 0 8px rgba(0, 0, 0, 0.12);
+  .turn-front canvas,
+  .turn-flap-back canvas {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+    background: #fff;
   }
 
   /* =========================================================
@@ -1162,10 +1629,6 @@
       max-height: calc(100cqh - 24px);
     }
 
-    .turning-page {
-      width: 100%;
-    }
-
     .book-spread:not(.single)::after {
       width: 10px;
     }
@@ -1195,13 +1658,42 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .turning-page,
-    .turn-face,
     .book-spread,
     .page-sheet,
     .single-page {
       transition: none !important;
       animation: none !important;
     }
+  }
+
+  /* =========================================================
+     KERTAS PUTIH: permukaan halaman harus terlihat jelas,
+     sedangkan efek lipatan hanya berada di tepi kertas.
+  ========================================================= */
+  .page-sheet {
+    background: #fff !important;
+    /* border: 1px solid #d9dee7; */
+
+    box-shadow:
+      0 -3px 8px 2px rgba(0, 0, 0, 0.12),
+      -5px 0 12px 3px rgba(0, 0, 0, 0.1),
+      5px 0 12px 3px rgba(0, 0, 0, 0.1),
+      0 2px 2px 0 rgba(0, 0, 0, 0.04),
+      inset 8px 0 10px -7px rgba(190, 190, 190, 0.55);
+  }
+
+  .page-sheet canvas {
+    position: relative;
+    z-index: 1;
+    background: #fff !important;
+  }
+
+  .page-edge {
+    z-index: 2;
+    box-shadow: inset 0 0 12px rgba(15, 23, 42, 0.025);
+  }
+
+  .left-edge {
+    box-shadow: inset -10px 0 14px rgba(15, 23, 42, 0.07);
   }
 </style>
